@@ -1,0 +1,212 @@
+import numpy as np
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # 只打印error
+
+def cross_entropy_error(y,t):
+    delta = 1e-7
+    return -np.sum(t * np.log(y + delta))
+
+def softmax(a):
+    c = np.max(a)
+    exp_a = np.exp(a-c)
+    sum_exp_a = np.sum(exp_a)
+    y = exp_a / sum_exp_a
+    return y
+
+class Relu():
+    def __init__(self):
+        self.mask = None
+
+    def forward(self,x):
+        self.mask = (x<=0)
+        out = x.copy()
+        out[self.mask] = 0
+        return out
+
+    def backward(self,dout):
+        dout[self.mask] = 0
+        dx = dout
+        return dx
+
+class SoftmaxWithLoss():
+    def __init__(self):
+        self.loss  = None
+        self.y = None #输出(预测）结果
+        self.t = None #监督数据（one_hot vector）
+
+    def forward(self,x,t):
+        self.t = t
+        self.y = softmax(x)
+        self.loss = cross_entropy_error(y,t)
+        return self.loss
+
+    def backward(self,dout = 1):
+        batch_size = self.t.shape[0]
+        dx = (self.y - self.t) / batch_size
+        return dx
+
+
+def im2col(input_data, filter_h, filter_w, stride=1, pad=0):
+    """
+
+    Parameters
+    ----------
+    input_data : 由(数据量, 通道, 高, 长)的4维数组构成的输入数据
+    filter_h : 滤波器的高
+    filter_w : 滤波器的长
+    stride : 步幅
+    pad : 填充
+
+    Returns
+    -------
+    col : 2维数组
+    """
+    N, C, H, W = input_data.shape
+    out_h = (H + 2*pad - filter_h)//stride + 1
+    out_w = (W + 2*pad - filter_w)//stride + 1
+
+    img = np.pad(input_data, [(0,0), (0,0), (pad, pad), (pad, pad)], 'constant')
+    col = np.zeros((N, C, filter_h, filter_w, out_h, out_w))
+
+    for y in range(filter_h):
+        y_max = y + stride*out_h
+        for x in range(filter_w):
+            x_max = x + stride*out_w
+            col[:, :, y, x, :, :] = img[:, :, y:y_max:stride, x:x_max:stride]
+
+    col = col.transpose(0, 4, 5, 1, 2, 3).reshape(N*out_h*out_w, -1)
+    return col
+
+def col2im(col, input_shape, filter_h, filter_w, stride=1, pad=0):
+    """
+
+    Parameters
+    ----------
+    col :
+    input_shape : 输入数据的形状（例：(10, 1, 28, 28)）
+    filter_h :
+    filter_w
+    stride
+    pad
+
+    Returns
+    -------
+
+    """
+    N, C, H, W = input_shape
+    out_h = (H + 2*pad - filter_h)//stride + 1
+    out_w = (W + 2*pad - filter_w)//stride + 1
+    col = col.reshape(N, out_h, out_w, C, filter_h, filter_w).transpose(0, 3, 4, 5, 1, 2)
+
+    img = np.zeros((N, C, H + 2*pad + stride - 1, W + 2*pad + stride - 1))
+    for y in range(filter_h):
+        y_max = y + stride*out_h
+        for x in range(filter_w):
+            x_max = x + stride*out_w
+            img[:, :, y:y_max:stride, x:x_max:stride] += col[:, :, y, x, :, :]
+
+    return img[:, :, pad:H + pad, pad:W + pad]
+
+
+class Convolution():
+    def __init__(self,w,b,stride = 1 ,pad = 0):
+        self.W = w
+        self.b = b
+        self.stride = stride
+        self.pad = pad
+
+        # 中间数据（backward时使用）
+        self.x = None
+        self.col = None
+        self.col_W = None
+
+        # 权重和偏置参数的梯度
+        self.dW = None
+        self.db = None
+
+    def forward(self,x):
+        FN , C , FH , FW = self.W.shape
+        N , C , H , W = x.shape
+        out_h = int(1 + (H + 2*self.pad - FH) / self.stride)
+        out_w = int(1 + (W + 2*self.pad - FW) / self.stride)
+
+        col = im2col(x,FH,FW,self.stride,self.pad)
+        col_W = self.W.reshape(FN,-1).T #滤波器的展开
+        out = np.dot(col, col_W) + self.b
+
+        out = out.reshape(N , out_h , out_w,-1).transpose(0,3,1,2)
+        return out
+
+    def backward(self, dout):
+        FN, C, FH, FW = self.W.shape
+        dout = dout.transpose(0,2,3,1).reshape(-1, FN)
+
+        self.db = np.sum(dout, axis=0)
+        self.dW = np.dot(self.col.T, dout)
+        self.dW = self.dW.transpose(1, 0).reshape(FN, C, FH, FW)
+
+        dcol = np.dot(dout, self.col_W.T)
+        dx = col2im(dcol, self.x.shape, FH, FW, self.stride, self.pad)
+
+        return dx
+
+class Pooling():
+    def __init__(self,pool_h,pool_w,stride = 1,pad = 0):
+        self.pool_h = pool_h
+        self.pool_w = pool_w
+        self.stride = stride
+        self.pad = pad
+
+        self.x = None
+        self.arg_max = None
+
+    def forward(self,x):
+        N , C , H , W = x.shape
+        out_h = int(1 + (H - 2*self.pad - self.pool_h)/self.stride)
+        out_w = int(1 + (W - 2*self.pad - self.pool_w)/ self.stride)
+
+        col = im2col(x,out_h,out_w,self.pool_h,self.pool_w,self.stride,self.pad)
+        col = col.reshape(-1, self.pool_h * self.pool_w)
+
+        arg_max = np.argmax(col, axis=1)
+        out = np.max(col , axis= 1)
+        out = out.reshape(N , out_h , out_w , C).transpose(0 , 3, 1, 2)
+
+        self.x = x
+        self.arg_max = arg_max
+
+        return out
+
+    def backward(self, dout):
+        dout = dout.transpose(0, 2, 3, 1)
+
+        pool_size = self.pool_h * self.pool_w
+        dmax = np.zeros((dout.size, pool_size))
+        dmax[np.arange(self.arg_max.size), self.arg_max.flatten()] = dout.flatten()
+        dmax = dmax.reshape(dout.shape + (pool_size,))
+
+        dcol = dmax.reshape(dmax.shape[0] * dmax.shape[1] * dmax.shape[2], -1)
+        dx = col2im(dcol, self.x.shape, self.pool_h, self.pool_w, self.stride, self.pad)
+
+        return dx
+
+class Affine():
+    def __init__(self,w,b):
+        self.W = w
+        self.b = b
+        self.x = None
+        self.dW = None
+        self.db = None
+
+    def forward(self,x):
+        self.x = x
+        out = np.dot(x,self.W)
+        out = out + self.b
+        return out
+
+    def backward(self,dout):
+        dx = np.dot(dout,self.W.T)
+        self.dW = np.dot(self.x.T,dout)
+        self.db = np.sum(dout,axis=0)
+
+        return dx
